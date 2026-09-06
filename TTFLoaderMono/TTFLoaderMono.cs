@@ -39,11 +39,12 @@ namespace TTFLoaderMono
         // （仅修改 TMP_Settings.defaultFontAsset 不会刷新已经在场景里实例化的 TMP 文字）
         private static TMP_FontAsset customTmpFont;
 
-        // 记录已经替换过字体的 TMP 实例 ID，用于 Naninovel 反复合时静默处理，
-        // 避免每 0.1s 轮询都刷几十行 "Replacing font on ..." 日志。
-        // 注意：UnityEngine.Object.GetInstanceID() 在 TMP 被 Destroy 时复用 ID，
+        // 记录每个 TMP 实例上次观察到的字体资产 InstanceID。
+        // 当 (tmp.instanceId, font.instanceId) 组合与上次一致时，说明已被我们替换且没被重置，跳过打印。
+        // 当组合变化时，说明 Naninovel 重置了字体（或我们刚替换），静默恢复并打印一行。
+        // 注意：UnityEngine.Object.GetInstanceID() 在 TMP 被 Destroy 时会复用 ID，
         // 但我们有引用持有，不需要操心 ID 复用。
-        private static readonly HashSet<int> replacedTmpInstances = new HashSet<int>();
+        private static readonly Dictionary<int, int> lastObservedFontPerTmp = new Dictionary<int, int>();
 
         /// <summary>
         /// BepInEx 插件初始化时调用，类似于 Unity 的 Awake
@@ -224,44 +225,56 @@ namespace TTFLoaderMono
                 scanned++;
                 string text = tmp.text;
                 int instanceId = tmp.GetInstanceID();
+                int currentFontId = tmp.font != null ? tmp.font.GetInstanceID() : 0;
 
                 bool fontReplacedThisRound = false;
 
-                // 步骤 1：替换 .font 引用。如果当前引用的是我们设置的字体，跳过替换但仍继续走字符补齐 + 重建 mesh 的路径，
-                // 因为 Naninovel 可能在我们看不见的地方切换过 fontAsset 引用。
+                // 步骤 1：替换 .font 引用。
+                // 用 (tmp.instanceId, font.instanceId) 对比上次观察值，避免对已被替换且没被
+                // Naninovel 重置的 TMP 反复打印；同时检测 Naninovel 的重置（New Serif_Regular 2 等）
+                // 并静默恢复。
+                int lastFontId;
+                lastObservedFontPerTmp.TryGetValue(instanceId, out lastFontId);
+
                 if (tmp.font != customTmpFont)
                 {
-                    bool isFirstReplace = !replacedTmpInstances.Contains(instanceId);
+                    bool isFirstTimeForThisTmp = lastFontId == 0;
                     string oldFontName = tmp.font != null ? tmp.font.name : "<null>";
                     string preview = text ?? string.Empty;
                     if (preview.Length > 32)
                     {
                         preview = preview.Substring(0, 32) + "…";
                     }
-                    if (isFirstReplace)
+                    if (isFirstTimeForThisTmp)
                     {
                         Logger.LogInfo(
                             $"[TextMeshProUGUI] Replacing font on '{GetScenePath(tmp)}' " +
                             $"(active={tmp.gameObject.activeInHierarchy}, original='{oldFontName}', text='{preview}')");
                     }
-                    else
+                    else if (lastFontId == currentFontId)
                     {
-                        // 之前替换过但又被 Naninovel 重置回原 font，静默恢复避免刷屏
+                        // 上次也是这个非自定义字体 → Naninovel 重置了我们的字体，静默恢复
                         silentRestored++;
                     }
+                    else
+                    {
+                        // 上次是另一个非自定义字体（罕见）→ 打印以便诊断
+                        Logger.LogInfo(
+                            $"[TextMeshProUGUI] Replacing font on '{GetScenePath(tmp)}' " +
+                            $"(active={tmp.gameObject.activeInHierarchy}, original='{oldFontName}', text='{preview}')");
+                    }
+                    // 双重保险：除了公开 setter，还通过反射直接写入 TMP 内部的 m_fontAsset 字段。
+                    // Naninovel 的 UI 脚本可能在我们的 setter 之后立即又重置 tmp.font，
+                    // 但只要我们在轮询中再读到 m_fontAsset 就能保证它指向我们的字体。
                     tmp.font = customTmpFont;
-                    replacedTmpInstances.Add(instanceId);
+                    ForceSetTmpFontAsset(tmp, customTmpFont);
+                    currentFontId = customTmpFont.GetInstanceID();
                     replaced++;
                     fontReplacedThisRound = true;
                 }
-                else
-                {
-                    // 当前已经是我们的字体，记录进集合（防止后续被重置时反复打印 "Replacing"）
-                    if (!replacedTmpInstances.Contains(instanceId))
-                    {
-                        replacedTmpInstances.Add(instanceId);
-                    }
-                }
+
+                // 更新观察记录：本次观察到 currentFontId（即 customTmpFont）
+                lastObservedFontPerTmp[instanceId] = currentFontId;
 
                 // 步骤 2：检查当前文本是否含未收录字符，若有则补齐图集。
                 // Dynamic 模式下即便没补齐，TMP 也会在 ForceMeshUpdate 时自动从 sourceFontFile 读，
@@ -668,6 +681,55 @@ namespace TTFLoaderMono
             // 旧版本 TMP 用 m_fontSource；保险起见再试一次
             FieldInfo legacy = typeof(TMP_FontAsset).GetField("m_fontSource", flags);
             legacy?.SetValue(asset, source);
+        }
+
+        /// <summary>
+        /// 通过反射直接写入 TextMeshProUGUI 内部的 m_fontAsset 字段。
+        ///
+        /// 背景：Naninovel 的 UI 脚本会在 PlayerLoop 中反复把 .font 设回自己的 fontAsset。
+        /// 我们的轮询虽然每次都调用 tmp.font = customTmpFont，但 Naninovel 可能在同一帧
+        /// 内的下一行又把它改回去——结果下次轮询看到的就是被重置后的字体。
+        ///
+        /// 直接写 m_fontAsset 字段虽然视觉上看不到区别，但能保证我们的后续轮询一定能
+        /// 读到 m_fontAsset == customTmpFont（除非 Naninovel 也用反射写字段）。
+        /// 同时强制重建 m_material 让 TMP 内部材质缓存同步到新 atlas。
+        /// </summary>
+        private static void ForceSetTmpFontAsset(TextMeshProUGUI tmp, TMP_FontAsset font)
+        {
+            if (tmp == null || font == null)
+            {
+                return;
+            }
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+            string[] fieldNames = { "m_fontAsset", "m_fontAssets" };
+            foreach (string name in fieldNames)
+            {
+                FieldInfo fi = typeof(TextMeshProUGUI).GetField(name, flags);
+                if (fi == null)
+                {
+                    continue;
+                }
+                try
+                {
+                    if (fi.FieldType == typeof(TMP_FontAsset))
+                    {
+                        fi.SetValue(tmp, font);
+                    }
+                    else if (fi.FieldType.IsArray)
+                    {
+                        // m_fontAssets 是 TMP_FontAsset[]，通常只放一个
+                        var arr = (Array)fi.GetValue(tmp);
+                        if (arr != null && arr.Length > 0)
+                        {
+                            arr.SetValue(font, 0);
+                        }
+                    }
+                }
+                catch
+                {
+                    // 继续尝试下一个候选
+                }
+            }
         }
 
         /// <summary>
