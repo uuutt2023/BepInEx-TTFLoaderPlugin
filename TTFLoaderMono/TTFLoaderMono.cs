@@ -552,6 +552,38 @@ namespace TTFLoaderMono
         }
 
         /// <summary>
+        /// 标记 Font 为 dynamic 模式，让 TMP 在 Dynamic 模式下能通过 RequestCharactersInTexture
+        /// 从此 Font 读取缺失字符的 glyph。Unity 把 Font.dynamic 的 setter 设为 internal，
+        /// 公开 API 无法直接赋值；这里通过反射写入 m_IsDynamic 备份字段。
+        /// </summary>
+        private static void SetFontDynamicTrue(Font font)
+        {
+            if (font == null)
+            {
+                return;
+            }
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+            string[] fieldNames = { "m_IsDynamic", "m_dynamic", "isDynamic" };
+            foreach (string name in fieldNames)
+            {
+                FieldInfo fi = typeof(Font).GetField(name, flags);
+                if (fi == null || fi.FieldType != typeof(bool))
+                {
+                    continue;
+                }
+                try
+                {
+                    fi.SetValue(font, true);
+                    return;
+                }
+                catch
+                {
+                    // 尝试下一个候选字段名
+                }
+            }
+        }
+
+        /// <summary>
         /// TMP_FontAsset.sourceFontFile 是只读属性，但它是 TMP 内部用于"缺失字符时读取
         /// glyph"的来源（Dynamic 模式必需）。这里通过反射强行写入备份字段，
         /// 让自定义 TMP_FontAsset 在面对未收录字符时也能正确渲染。
@@ -606,8 +638,26 @@ namespace TTFLoaderMono
             if (File.Exists(ttfPath))
             {
                 Logger.LogInfo($"Found TTF file: {ttfPath}");
-                // 根据 dynamic 参数创建字体：动态字体（OSFont）或普通字体（从文件路径）
-                font = dynamic ? Font.CreateDynamicFontFromOSFont(ttfPath, 16) : new Font(ttfPath);
+                if (dynamic)
+                {
+                    // 注意：CreateDynamicFontFromOSFont 只接受已安装的系统字体名（如 "Arial"），
+                    // 传入文件路径会返回 null 并打印 "Unable to load font face ..." 警告。
+                    // 这里传 ttfPath 时虽然走的是 dynamic 路径，但 Unity 实际无法从文件路径加载 OS 字体，
+                    // 因此走 dynamic=true 时 TTF 文件路径分支会被跳过，由下面的系统字体 fallback 接管。
+                    font = Font.CreateDynamicFontFromOSFont(ttfPath, 16);
+                }
+                else
+                {
+                    // 从 .ttf 文件路径直接构造 Font（Unity 会从 TTF 的 OS/2 表读取 family name）
+                    font = new Font(ttfPath);
+                    // 标记为动态字体（Font.dynamic 是只读属性，用反射写 m_IsDynamic 备份字段），
+                    // 这样 TMP 在 Dynamic 模式下可通过 RequestCharactersInTexture 从此 Font
+                    // 读取缺失字符的 glyph（即作为 TMP 的 sourceFontFile 后端）。
+                    if (font != null)
+                    {
+                        SetFontDynamicTrue(font);
+                    }
+                }
             }
 
             if (font != null)
@@ -663,15 +713,17 @@ namespace TTFLoaderMono
         {
             try
             {
-                // 先加载基础 Unity Font（必须用 dynamic 模式加载，确保 baseFont 是带 OS 字体的运行时实例）
-                Font baseFont = LoadTTF(fontName, true);
+                // 先加载基础 Unity Font（dynamic=false：从 .ttf 文件路径直接加载，
+                // 不要用 CreateDynamicFontFromOSFont 传文件路径——它只接受已安装的系统字体名，
+                // 传文件路径会返回 null，导致 TMP_FontAsset.CreateFontAsset 后续拿到 null）。
+                Font baseFont = LoadTTF(fontName, false);
                 if (baseFont == null)
                 {
                     Logger.LogError($"Failed to load base font: {fontName}");
                     return null;
                 }
 
-                // 创建 TMP 字体资源 (可能为null)
+                // 创建 TMP 字体资源（baseFont 必须有效，否则返回 null）
                 TMP_FontAsset tmpFont = TMP_FontAsset.CreateFontAsset(baseFont);
 
                 if (tmpFont == null)
@@ -696,7 +748,7 @@ namespace TTFLoaderMono
                 Logger.LogError($"Failed to create TMP font {fontName}: {ex.Message}\n{ex.StackTrace}");
 
                 Logger.LogInfo("Trying use UI.Text");
-                // 尝试使用 LoadTTF 加载动态字体
+                // 兜底走 UI.Text 路径：使用 dynamic 模式加载（会用 OS 字体名作为来源）
                 Font baseFont = LoadTTF(fontName, true);
                 if (baseFont == null)
                 {
