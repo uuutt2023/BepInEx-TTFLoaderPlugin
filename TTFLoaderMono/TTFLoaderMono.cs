@@ -136,10 +136,22 @@ namespace TTFLoaderMono
             ApplyCustomFontToAllTMPTexts();
             ApplyCustomFontToAllTexts();
 
-            var wait = new UnityEngine.WaitForSecondsRealtime(0.25f);
+            // 前 4 次用 0.25s 间隔，覆盖场景初始化（UI Prefab 集中实例化的高峰）
+            var fastWait = new UnityEngine.WaitForSecondsRealtime(0.25f);
+            for (int i = 0; i < 4; i++)
+            {
+                yield return fastWait;
+                ApplyCustomFontToAllTMPTexts();
+                ApplyCustomFontToAllTexts();
+            }
+
+            // 之后切到 1s 间隔，稳态性能友好。
+            // 玩家触发对话/翻页/打开日志等事件时，Naninovel 会调 TMP 的 .text setter，
+            // 我们的 .font 引用还在；下一轮会替换。1 秒延迟在视觉上无感知。
+            var slowWait = new UnityEngine.WaitForSecondsRealtime(1.0f);
             while (true)
             {
-                yield return wait;
+                yield return slowWait;
                 ApplyCustomFontToAllTMPTexts();
                 ApplyCustomFontToAllTexts();
             }
@@ -211,6 +223,8 @@ namespace TTFLoaderMono
                 scanned++;
                 string text = tmp.text;
 
+                bool fontReplacedThisRound = false;
+
                 // 步骤 1：替换 .font 引用。如果当前引用的是我们设置的字体，跳过替换但仍继续走字符补齐 + 重建 mesh 的路径，
                 // 因为 Naninovel 可能在我们看不见的地方切换过 fontAsset 引用。
                 if (tmp.font != customTmpFont)
@@ -226,6 +240,7 @@ namespace TTFLoaderMono
                         $"(active={tmp.gameObject.activeInHierarchy}, original='{oldFontName}', text='{preview}')");
                     tmp.font = customTmpFont;
                     replaced++;
+                    fontReplacedThisRound = true;
                 }
 
                 // 步骤 2：检查当前文本是否含未收录字符，若有则补齐图集。
@@ -251,14 +266,15 @@ namespace TTFLoaderMono
                                     $"[TextMeshProUGUI] Expanded customTmpFont atlas by " +
                                     $"{missingChars.Count} glyph(s) for '{GetScenePath(tmp)}'");
                             }
+                            // 字符补齐后必须重建 mesh 才能用上新字符
+                            fontReplacedThisRound = true;
                         }
                     }
                 }
 
-                // 步骤 3：强制 mesh 重建。设置 .font 之后 TMP 并不会自动重新排版，
-                // 必须显式调用 ForceMeshUpdate 才能让当前 text 用新字体重新生成顶点/UV。
-                // 这对 Naninovel 这种在 PlayerLoop 里直接修改 .text 的场景至关重要。
-                if (tmp.gameObject.activeInHierarchy)
+                // 步骤 3：强制 mesh 重建。关键：只在 fontReplacedThisRound == true 时调用。
+                // 否则会对已替换过字体的 TMP 进行每秒数千次无意义的 mesh 重建，导致游戏闪退。
+                if (fontReplacedThisRound && tmp.gameObject.activeInHierarchy)
                 {
                     tmp.ForceMeshUpdate(true, true);
                     meshRebuilt++;
