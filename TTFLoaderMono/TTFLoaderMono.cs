@@ -186,6 +186,10 @@ namespace TTFLoaderMono
         /// 查找场景中所有的 TextMeshProUGUI 组件并替换为自定义 TMP_FontAsset。
         /// 仅修改 TMP_Settings.defaultFontAsset 不会影响已经实例化的 TMP 文字（它们各自的 .font 仍指向旧字体），
         /// 因此必须主动遍历并替换。该方法对反射查询到的所有组件（含非激活）一视同仁。
+        ///
+        /// 除了替换 .font 引用，还会在每次轮询中检查组件当前文本是否含尚未收录进
+        /// customTmpFont 图集的字符——若有则调用 TryAddCharacters 补齐，避免 Naninovel
+        /// 动态注入中文/韩文等非 ASCII 字符时显示豆腐块（□）。
         /// </summary>
         private void ApplyCustomFontToAllTMPTexts()
         {
@@ -196,6 +200,7 @@ namespace TTFLoaderMono
 
             int replaced = 0;
             int scanned = 0;
+            int expanded = 0;
             foreach (var tmp in FindAllTMPComponents(includeInactive: true))
             {
                 if (tmp == null)
@@ -203,6 +208,39 @@ namespace TTFLoaderMono
                     continue;
                 }
                 scanned++;
+
+                // 计算当前文本里是否含未收录字符（取自 sourceFontFile，即 LXGWWenKaiScreen.ttf）
+                string text = tmp.text;
+                List<char> missingChars = null;
+                bool needsExpand = !string.IsNullOrEmpty(text) &&
+                    !customTmpFont.HasCharacters(text, out missingChars) &&
+                    missingChars != null && missingChars.Count > 0;
+
+                if (needsExpand)
+                {
+                    // List<char> -> string（保留重复，便于 TMP 去重；底层会去重）
+                    var sbMissing = new System.Text.StringBuilder(missingChars.Count);
+                    foreach (var c in missingChars)
+                    {
+                        sbMissing.Append(c);
+                    }
+                    string missingStr = sbMissing.ToString();
+
+                    // 把缺失字符加入图集；图集会自动扩容并重新生成 atlas texture
+                    bool ok = customTmpFont.TryAddCharacters(missingStr);
+                    if (ok)
+                    {
+                        expanded++;
+                        if (expanded <= 3)
+                        {
+                            Logger.LogInfo(
+                                $"[TextMeshProUGUI] Expanded customTmpFont atlas by " +
+                                $"{missingChars.Count} glyph(s) for '{GetScenePath(tmp)}' " +
+                                $"(text preview='{(text.Length > 32 ? text.Substring(0, 32) + "…" : text)}')");
+                        }
+                    }
+                }
+
                 if (tmp.font == customTmpFont)
                 {
                     continue;
@@ -210,7 +248,7 @@ namespace TTFLoaderMono
                 // 详细诊断：输出场景层级路径、当前字体资源名、TMP 文本前 32 字（避免过长日志）
                 // 方便定位具体哪个 Naninovel 对话框/角色名/日志条没被替换上
                 string oldFontName = tmp.font != null ? tmp.font.name : "<null>";
-                string preview = tmp.text ?? string.Empty;
+                string preview = text ?? string.Empty;
                 if (preview.Length > 32)
                 {
                     preview = preview.Substring(0, 32) + "…";
@@ -221,9 +259,11 @@ namespace TTFLoaderMono
                 tmp.font = customTmpFont;
                 replaced++;
             }
-            if (replaced > 0)
+            if (replaced > 0 || expanded > 0)
             {
-                Logger.LogInfo($"Applied custom TMP font to {replaced}/{scanned} TextMeshProUGUI component(s).");
+                Logger.LogInfo(
+                    $"Applied custom TMP font to {replaced}/{scanned} TextMeshProUGUI component(s), " +
+                    $"atlas expanded for {expanded}.");
             }
         }
 
