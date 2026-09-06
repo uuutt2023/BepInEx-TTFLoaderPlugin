@@ -35,6 +35,10 @@ namespace TTFLoaderMono
         // 用于替换 UnityEngine.UI.Text 组件的字体
         private static Font dynamicFont;
 
+        // 用于替换场景中已存在的 TextMeshProUGUI 组件的字体
+        // （仅修改 TMP_Settings.defaultFontAsset 不会刷新已经在场景里实例化的 TMP 文字）
+        private static TMP_FontAsset customTmpFont;
+
         /// <summary>
         /// BepInEx 插件初始化时调用，类似于 Unity 的 Awake
         /// </summary>
@@ -62,7 +66,12 @@ namespace TTFLoaderMono
         void Start()
         {
             // 从预设的目录中查找并加载第一个可用的字体
+            // （该方法内部在成功后会主动遍历一次场景里现存的 TextMeshProUGUI 组件）
             LoadDefaultFontFromDirectory();
+
+            // 启动延迟协程，覆盖后续 Start/Awake 才实例化的 TMP 组件
+            // （典型于 Naninovel 这类动态 UI 系统）
+            StartCoroutine(ApplyFontAfterDelay());
 
             // 订阅场景加载完成事件，以便在新场景加载后应用字体
             SceneManager.sceneLoaded += OnSceneLoaded;
@@ -96,8 +105,9 @@ namespace TTFLoaderMono
             yield return null; // 等待当前帧结束（等待 Unity UI 初始化）
             yield return null; // 再等一帧（更保险，确保所有 Start/Awake 完成）
 
-            // 延迟后，对场景中的所有 Text 组件应用自定义字体
+            // 延迟后，对场景中的所有 UI.Text / TextMeshProUGUI 应用自定义字体
             ApplyCustomFontToAllTexts();
+            ApplyCustomFontToAllTMPTexts();
         }
 
         /// <summary>
@@ -117,6 +127,91 @@ namespace TTFLoaderMono
                     text.font = dynamicFont;
                 }
             }
+        }
+
+        /// <summary>
+        /// 查找场景中所有的 TextMeshProUGUI 组件并替换为自定义 TMP_FontAsset。
+        /// 仅修改 TMP_Settings.defaultFontAsset 不会影响已经实例化的 TMP 文字（它们各自的 .font 仍指向旧字体），
+        /// 因此必须主动遍历并替换。该方法对反射查询到的所有组件（含非激活）一视同仁。
+        /// </summary>
+        private void ApplyCustomFontToAllTMPTexts()
+        {
+            if (customTmpFont == null)
+            {
+                return;
+            }
+
+            int replaced = 0;
+            foreach (var tmp in FindAllTMPComponents(includeInactive: true))
+            {
+                if (tmp == null || tmp.font == customTmpFont)
+                {
+                    continue;
+                }
+                tmp.font = customTmpFont;
+                replaced++;
+            }
+            Logger.LogInfo($"Applied custom TMP font to {replaced} TextMeshProUGUI component(s).");
+        }
+
+        /// <summary>
+        /// 通过反射查找所有 TextMeshProUGUI 组件，兼容不同 Unity 版本中
+        /// Object.FindObjectsOfType 重载的可用情况，避免 MissingMethodException。
+        /// </summary>
+        /// <param name="includeInactive">是否包含挂载在非激活 GameObject 上的组件</param>
+        /// <returns>找到的 TextMeshProUGUI 组件列表</returns>
+        private List<TextMeshProUGUI> FindAllTMPComponents(bool includeInactive)
+        {
+            Type tmpType = typeof(TextMeshProUGUI);
+            Type objectType = typeof(UnityEngine.Object);
+            object found = null;
+
+            // 优先尝试带 includeInactive 参数的泛型重载（Unity 5.3+）
+            MethodInfo includeInactiveMethod = objectType.GetMethod(
+                "FindObjectsOfType",
+                BindingFlags.Static | BindingFlags.Public,
+                null,
+                new[] { typeof(bool) },
+                null);
+
+            if (includeInactiveMethod != null)
+            {
+                found = includeInactiveMethod
+                    .MakeGenericMethod(tmpType)
+                    .Invoke(null, new object[] { includeInactive });
+            }
+
+            // 回退：无参泛型重载（所有 Unity 版本都有），只覆盖激活对象
+            if (found == null)
+            {
+                MethodInfo basicMethod = objectType.GetMethod(
+                    "FindObjectsOfType",
+                    BindingFlags.Static | BindingFlags.Public,
+                    null,
+                    Type.EmptyTypes,
+                    null);
+
+                if (basicMethod != null)
+                {
+                    found = basicMethod
+                        .MakeGenericMethod(tmpType)
+                        .Invoke(null, null);
+                }
+            }
+
+            var result = new List<TextMeshProUGUI>();
+            if (found is object[] array)
+            {
+                foreach (var obj in array)
+                {
+                    if (obj is TextMeshProUGUI tmp)
+                    {
+                        result.Add(tmp);
+                    }
+                }
+            }
+
+            return result;
         }
 
         /// <summary>
@@ -222,6 +317,12 @@ namespace TTFLoaderMono
                                 $"Created TMP font {fontName} but failed to register as default ({setMsg}). " +
                                 "Will rely on UI.Text dynamic font fallback.");
                         }
+
+                        // 仅修改 TMP_Settings.defaultFontAsset 不会刷新场景中已存在的 TextMeshProUGUI 组件，
+                        // 它们各自持有对旧 TMP_FontAsset 的引用。这里立刻主动遍历替换一次，
+                        // 覆盖插件 Start() 阶段就能看到的 TMP 文字（例如引导/启动画面）。
+                        ApplyCustomFontToAllTMPTexts();
+
                         return; // 成功加载一个就退出
                     }
                     else
@@ -392,6 +493,8 @@ namespace TTFLoaderMono
                 }
 
                 tmpFont.name = fontName;
+                // 缓存引用，以便后续 ApplyCustomFontToAllTMPTexts 主动替换场景中已存在的 TMP 组件
+                customTmpFont = tmpFont;
                 Logger.LogInfo($"Successfully created TMP font: {fontName}");
                 return tmpFont;
             }
