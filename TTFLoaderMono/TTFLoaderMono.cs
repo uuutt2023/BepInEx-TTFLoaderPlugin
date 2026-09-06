@@ -73,6 +73,11 @@ namespace TTFLoaderMono
             // （典型于 Naninovel 这类动态 UI 系统）
             StartCoroutine(ApplyFontAfterDelay());
 
+            // 启动持续轮询协程，覆盖场景切换后通过对话/动画等事件
+            // 延迟实例化的 TMP 组件（例如 Naninovel 的对话框、说话人名字框、
+            // 对话日志等）。
+            StartCoroutine(PollAndApplyFontForever());
+
             // 订阅场景加载完成事件，以便在新场景加载后应用字体
             SceneManager.sceneLoaded += OnSceneLoaded;
         }
@@ -95,6 +100,11 @@ namespace TTFLoaderMono
         {
             // 启动协程，延迟应用字体，确保新场景的 UI 组件已完全初始化
             StartCoroutine(ApplyFontAfterDelay());
+
+            // 同时启动持续轮询协程，覆盖场景切换后通过对话/动画等事件
+            // 延迟实例化的 TMP 组件（例如 Naninovel 的对话框、说话人名字框、
+            // 对话日志等）。StartCoroutine 保证同名字协程可以并行存在多份。
+            StartCoroutine(PollAndApplyFontForever());
         }
 
         /// <summary>
@@ -108,6 +118,31 @@ namespace TTFLoaderMono
             // 延迟后，对场景中的所有 UI.Text / TextMeshProUGUI 应用自定义字体
             ApplyCustomFontToAllTexts();
             ApplyCustomFontToAllTMPTexts();
+        }
+
+        /// <summary>
+        /// 持续轮询协程：每隔 0.25 秒检查一次场景中所有 TextMeshProUGUI 与 UI.Text，
+        /// 替换掉仍然引用旧字体的组件。
+        ///
+        /// 用途：Naninovel 这类引擎会在玩家触发对话/翻页等事件后才把对话框、
+        /// 说话人名字框、对话日志的 Prefab Instantiate 到场景里，单纯靠
+        /// SceneManager.sceneLoaded 钩子覆盖不到。本协程以低频率轮询，
+        /// 性能开销可忽略（一帧内只是对几十个组件做引用相等性判断）。
+        /// </summary>
+        private IEnumerator PollAndApplyFontForever()
+        {
+            // 首次立即执行一次（与 ApplyFontAfterDelay 并行，但查找的快照可能不同，
+            // 因为多了 1~2 帧让更多 Start/Awake 完成）
+            ApplyCustomFontToAllTMPTexts();
+            ApplyCustomFontToAllTexts();
+
+            var wait = new UnityEngine.WaitForSecondsRealtime(0.25f);
+            while (true)
+            {
+                yield return wait;
+                ApplyCustomFontToAllTMPTexts();
+                ApplyCustomFontToAllTexts();
+            }
         }
 
         /// <summary>
