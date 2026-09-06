@@ -264,7 +264,9 @@ namespace TTFLoaderMono
                 }
 
                 // 步骤 2：检查当前文本是否含未收录字符，若有则补齐图集。
-                // 对 Dynamic 模式这只是预防——即便图集缺字符，TMP 在 ForceMeshUpdate 时也会自动从 sourceFontFile 补。
+                // Dynamic 模式下即便没补齐，TMP 也会在 ForceMeshUpdate 时自动从 sourceFontFile 读，
+                // 但我们主动补齐可避免渲染时短暂缺失字符。
+                bool atlasExpandedThisRound = false;
                 if (!string.IsNullOrEmpty(text))
                 {
                     List<char> missingChars;
@@ -280,21 +282,35 @@ namespace TTFLoaderMono
                         if (added)
                         {
                             expanded++;
+                            atlasExpandedThisRound = true;
                             if (expanded <= 3)
                             {
                                 Logger.LogInfo(
                                     $"[TextMeshProUGUI] Expanded customTmpFont atlas by " +
                                     $"{missingChars.Count} glyph(s) for '{GetScenePath(tmp)}'");
                             }
-                            // 字符补齐后必须重建 mesh 才能用上新字符
-                            fontReplacedThisRound = true;
                         }
                     }
                 }
 
-                // 步骤 3：强制 mesh 重建。关键：只在 fontReplacedThisRound == true 时调用。
-                // 否则会对已替换过字体的 TMP 进行每秒数千次无意义的 mesh 重建，导致游戏闪退。
-                if (fontReplacedThisRound && tmp.gameObject.activeInHierarchy)
+                // 步骤 3：图集扩容后必须重建 mesh + 强制更新 fontMaterial 引用，
+                // 否则 TMP 仍引用旧 atlas 纹理，渲染时会出现"字符已加但材质没刷新"的空白。
+                if (atlasExpandedThisRound && tmp.gameObject.activeInHierarchy)
+                {
+                    // 关键：TMP_FontAsset 扩容图集时会创建新 texture，但 TMP 组件缓存的
+                    // Material 实例仍持有旧 _MainTex 引用。重新赋值 font 引用会触发 TMP
+                    // 重建材质实例并指向新 atlas texture。
+                    tmp.font = customTmpFont;
+                    // 让 TMP 重新排版顶点（含新字符）
+                    tmp.ForceMeshUpdate(true, true);
+                    // 访问 fontMaterial 强制 shader _MainTex 属性同步
+                    var _ = tmp.fontMaterial;
+                    meshRebuilt++;
+                    fontReplacedThisRound = true;
+                }
+
+                // 步骤 4：font 引用刚被替换时也要重建 mesh
+                if (fontReplacedThisRound && !atlasExpandedThisRound && tmp.gameObject.activeInHierarchy)
                 {
                     tmp.ForceMeshUpdate(true, true);
                     meshRebuilt++;
