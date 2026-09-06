@@ -150,17 +150,35 @@ namespace TTFLoaderMono
         /// </summary>
         private void ApplyCustomFontToAllTexts()
         {
-            if (dynamicFont != null)
+            if (dynamicFont == null)
             {
-                // 查找所有激活或非激活的 UnityEngine.UI.Text 组件
-                // 注意：不直接调用 FindObjectsOfType<T>(bool includeInactive)，
-                // 该重载仅在 Unity 5.3+ 存在，在更旧的 Unity 运行时上会抛出 MissingMethodException。
-                // 改用反射按需选择可用重载，保证跨版本兼容。
-                foreach (var text in FindAllTextComponents(includeInactive: true))
+                return;
+            }
+
+            int replaced = 0;
+            int scanned = 0;
+            foreach (var text in FindAllTextComponents(includeInactive: true))
+            {
+                if (text == null)
                 {
-                    // 将所有找到的 UI.Text 组件的字体设置为加载的动态字体
-                    text.font = dynamicFont;
+                    continue;
                 }
+                scanned++;
+                if (text.font == dynamicFont)
+                {
+                    continue;
+                }
+                // 详细诊断：输出场景层级路径与原字体名，方便定位哪些 UI.Text 没替换
+                string oldFontName = text.font != null ? text.font.name : "<null>";
+                Logger.LogInfo(
+                    $"[UI.Text] Replacing font on '{GetScenePath(text)}' " +
+                    $"(active={text.gameObject.activeInHierarchy}, original='{oldFontName}')");
+                text.font = dynamicFont;
+                replaced++;
+            }
+            if (replaced > 0)
+            {
+                Logger.LogInfo($"Applied custom UnityEngine.Font to {replaced}/{scanned} UI.Text component(s).");
             }
         }
 
@@ -177,16 +195,66 @@ namespace TTFLoaderMono
             }
 
             int replaced = 0;
+            int scanned = 0;
             foreach (var tmp in FindAllTMPComponents(includeInactive: true))
             {
-                if (tmp == null || tmp.font == customTmpFont)
+                if (tmp == null)
                 {
                     continue;
                 }
+                scanned++;
+                if (tmp.font == customTmpFont)
+                {
+                    continue;
+                }
+                // 详细诊断：输出场景层级路径、当前字体资源名、TMP 文本前 32 字（避免过长日志）
+                // 方便定位具体哪个 Naninovel 对话框/角色名/日志条没被替换上
+                string oldFontName = tmp.font != null ? tmp.font.name : "<null>";
+                string preview = tmp.text ?? string.Empty;
+                if (preview.Length > 32)
+                {
+                    preview = preview.Substring(0, 32) + "…";
+                }
+                Logger.LogInfo(
+                    $"[TextMeshProUGUI] Replacing font on '{GetScenePath(tmp)}' " +
+                    $"(active={tmp.gameObject.activeInHierarchy}, original='{oldFontName}', text='{preview}')");
                 tmp.font = customTmpFont;
                 replaced++;
             }
-            Logger.LogInfo($"Applied custom TMP font to {replaced} TextMeshProUGUI component(s).");
+            if (replaced > 0)
+            {
+                Logger.LogInfo($"Applied custom TMP font to {replaced}/{scanned} TextMeshProUGUI component(s).");
+            }
+        }
+
+        /// <summary>
+        /// 返回组件在场景中的完整层级路径，例如
+        ///   "Naninovel<Runtime>/UI/InvenUI/Pages/PrevPageButton/Text"
+        /// 当组件不在任何加载场景中时回退到 GameObject 名。
+        /// </summary>
+        private static string GetScenePath(UnityEngine.Object obj)
+        {
+            if (obj == null)
+            {
+                return "<null>";
+            }
+
+            // 优先走 Transform.parent 链（GameObject 与 Component 都可拿到 transform）
+            var transform = obj is UnityEngine.Component comp ? comp.transform : null;
+            if (transform == null)
+            {
+                return obj.name;
+            }
+
+            var sb = new System.Text.StringBuilder(transform.name);
+            var t = transform.parent;
+            while (t != null)
+            {
+                sb.Insert(0, "/");
+                sb.Insert(0, t.name);
+                t = t.parent;
+            }
+            return sb.ToString();
         }
 
         /// <summary>
