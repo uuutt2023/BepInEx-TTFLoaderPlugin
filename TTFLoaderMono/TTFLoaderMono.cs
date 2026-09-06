@@ -201,6 +201,7 @@ namespace TTFLoaderMono
             int replaced = 0;
             int scanned = 0;
             int expanded = 0;
+            int meshRebuilt = 0;
             foreach (var tmp in FindAllTMPComponents(includeInactive: true))
             {
                 if (tmp == null)
@@ -208,62 +209,66 @@ namespace TTFLoaderMono
                     continue;
                 }
                 scanned++;
-
-                // 计算当前文本里是否含未收录字符（取自 sourceFontFile，即 LXGWWenKaiScreen.ttf）
                 string text = tmp.text;
-                List<char> missingChars = null;
-                bool needsExpand = !string.IsNullOrEmpty(text) &&
-                    !customTmpFont.HasCharacters(text, out missingChars) &&
-                    missingChars != null && missingChars.Count > 0;
 
-                if (needsExpand)
+                // 步骤 1：替换 .font 引用。如果当前引用的是我们设置的字体，跳过替换但仍继续走字符补齐 + 重建 mesh 的路径，
+                // 因为 Naninovel 可能在我们看不见的地方切换过 fontAsset 引用。
+                if (tmp.font != customTmpFont)
                 {
-                    // List<char> -> string（保留重复，便于 TMP 去重；底层会去重）
-                    var sbMissing = new System.Text.StringBuilder(missingChars.Count);
-                    foreach (var c in missingChars)
+                    string oldFontName = tmp.font != null ? tmp.font.name : "<null>";
+                    string preview = text ?? string.Empty;
+                    if (preview.Length > 32)
                     {
-                        sbMissing.Append(c);
+                        preview = preview.Substring(0, 32) + "…";
                     }
-                    string missingStr = sbMissing.ToString();
+                    Logger.LogInfo(
+                        $"[TextMeshProUGUI] Replacing font on '{GetScenePath(tmp)}' " +
+                        $"(active={tmp.gameObject.activeInHierarchy}, original='{oldFontName}', text='{preview}')");
+                    tmp.font = customTmpFont;
+                    replaced++;
+                }
 
-                    // 把缺失字符加入图集；图集会自动扩容并重新生成 atlas texture
-                    bool ok = customTmpFont.TryAddCharacters(missingStr);
-                    if (ok)
+                // 步骤 2：检查当前文本是否含未收录字符，若有则补齐图集。
+                // 对 Dynamic 模式这只是预防——即便图集缺字符，TMP 在 ForceMeshUpdate 时也会自动从 sourceFontFile 补。
+                if (!string.IsNullOrEmpty(text))
+                {
+                    List<char> missingChars;
+                    if (!customTmpFont.HasCharacters(text, out missingChars) &&
+                        missingChars != null && missingChars.Count > 0)
                     {
-                        expanded++;
-                        if (expanded <= 3)
+                        var sbMissing = new System.Text.StringBuilder(missingChars.Count);
+                        foreach (var c in missingChars)
                         {
-                            Logger.LogInfo(
-                                $"[TextMeshProUGUI] Expanded customTmpFont atlas by " +
-                                $"{missingChars.Count} glyph(s) for '{GetScenePath(tmp)}' " +
-                                $"(text preview='{(text.Length > 32 ? text.Substring(0, 32) + "…" : text)}')");
+                            sbMissing.Append(c);
+                        }
+                        bool added = customTmpFont.TryAddCharacters(sbMissing.ToString());
+                        if (added)
+                        {
+                            expanded++;
+                            if (expanded <= 3)
+                            {
+                                Logger.LogInfo(
+                                    $"[TextMeshProUGUI] Expanded customTmpFont atlas by " +
+                                    $"{missingChars.Count} glyph(s) for '{GetScenePath(tmp)}'");
+                            }
                         }
                     }
                 }
 
-                if (tmp.font == customTmpFont)
+                // 步骤 3：强制 mesh 重建。设置 .font 之后 TMP 并不会自动重新排版，
+                // 必须显式调用 ForceMeshUpdate 才能让当前 text 用新字体重新生成顶点/UV。
+                // 这对 Naninovel 这种在 PlayerLoop 里直接修改 .text 的场景至关重要。
+                if (tmp.gameObject.activeInHierarchy)
                 {
-                    continue;
+                    tmp.ForceMeshUpdate(true, true);
+                    meshRebuilt++;
                 }
-                // 详细诊断：输出场景层级路径、当前字体资源名、TMP 文本前 32 字（避免过长日志）
-                // 方便定位具体哪个 Naninovel 对话框/角色名/日志条没被替换上
-                string oldFontName = tmp.font != null ? tmp.font.name : "<null>";
-                string preview = text ?? string.Empty;
-                if (preview.Length > 32)
-                {
-                    preview = preview.Substring(0, 32) + "…";
-                }
-                Logger.LogInfo(
-                    $"[TextMeshProUGUI] Replacing font on '{GetScenePath(tmp)}' " +
-                    $"(active={tmp.gameObject.activeInHierarchy}, original='{oldFontName}', text='{preview}')");
-                tmp.font = customTmpFont;
-                replaced++;
             }
-            if (replaced > 0 || expanded > 0)
+            if (replaced > 0 || expanded > 0 || meshRebuilt > 0)
             {
                 Logger.LogInfo(
                     $"Applied custom TMP font to {replaced}/{scanned} TextMeshProUGUI component(s), " +
-                    $"atlas expanded for {expanded}.");
+                    $"atlas expanded for {expanded}, mesh rebuilt for {meshRebuilt}.");
             }
         }
 
@@ -547,6 +552,41 @@ namespace TTFLoaderMono
         }
 
         /// <summary>
+        /// TMP_FontAsset.sourceFontFile 是只读属性，但它是 TMP 内部用于"缺失字符时读取
+        /// glyph"的来源（Dynamic 模式必需）。这里通过反射强行写入备份字段，
+        /// 让自定义 TMP_FontAsset 在面对未收录字符时也能正确渲染。
+        /// </summary>
+        private static void TrySetSourceFontFile(TMP_FontAsset asset, Font source)
+        {
+            if (asset == null || source == null)
+            {
+                return;
+            }
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            string[] fieldNames = { "m_sourceFontFile", "sourceFontFile", "k_SourceFontFile" };
+            foreach (string name in fieldNames)
+            {
+                FieldInfo fi = typeof(TMP_FontAsset).GetField(name, flags);
+                if (fi == null)
+                {
+                    continue;
+                }
+                try
+                {
+                    fi.SetValue(asset, source);
+                    return;
+                }
+                catch
+                {
+                    // 尝试下一个候选
+                }
+            }
+            // 旧版本 TMP 用 m_fontSource；保险起见再试一次
+            FieldInfo legacy = typeof(TMP_FontAsset).GetField("m_fontSource", flags);
+            legacy?.SetValue(asset, source);
+        }
+
+        /// <summary>
         /// 加载 TTF 字体文件并返回 Unity Font 对象
         /// </summary>
         /// <param name="fontName">字体文件名（不含扩展名）</param>
@@ -610,7 +650,12 @@ namespace TTFLoaderMono
         }
 
         /// <summary>
-        /// 加载 TTF 字体并创建 TMP_FontAsset 对象
+        /// 加载 TTF 字体并创建 TMP_FontAsset 对象。
+        ///
+        /// 关键点：必须把 TMP_FontAsset 的 atlasPopulationMode 设为 Dynamic，并保留 baseFont
+        /// 的强引用（赋值给 fontAsset.sourceFontFile），这样当 Naninovel 在运行时注入
+        /// 中文/韩文等新字符时，TMP 会主动从 sourceFontFile 读取 glyph 并动态加入 atlas，
+        /// 而不是回退到原 SDF 字体显示豆腐块。
         /// </summary>
         /// <param name="fontName">字体文件名（不含扩展名）</param>
         /// <returns>TMP_FontAsset 对象</returns>
@@ -618,8 +663,8 @@ namespace TTFLoaderMono
         {
             try
             {
-                // 先加载基础 Unity Font
-                Font baseFont = LoadTTF(fontName);
+                // 先加载基础 Unity Font（必须用 dynamic 模式加载，确保 baseFont 是带 OS 字体的运行时实例）
+                Font baseFont = LoadTTF(fontName, true);
                 if (baseFont == null)
                 {
                     Logger.LogError($"Failed to load base font: {fontName}");
@@ -635,10 +680,15 @@ namespace TTFLoaderMono
                     return null;
                 }
 
+                // ★ 核心：设为 Dynamic 模式，TMP 会在缺失字符时主动从 sourceFontFile 读取 glyph
+                tmpFont.atlasPopulationMode = AtlasPopulationMode.Dynamic;
+                // sourceFontFile 是只读属性，用反射强行写入（TMP 内部读取它来在缺失字符时获取 glyph）
+                TrySetSourceFontFile(tmpFont, baseFont);
+
                 tmpFont.name = fontName;
                 // 缓存引用，以便后续 ApplyCustomFontToAllTMPTexts 主动替换场景中已存在的 TMP 组件
                 customTmpFont = tmpFont;
-                Logger.LogInfo($"Successfully created TMP font: {fontName}");
+                Logger.LogInfo($"Successfully created TMP font: {fontName} (atlasPopulationMode=Dynamic, sourceFontFile={baseFont.name})");
                 return tmpFont;
             }
             catch (Exception ex)
