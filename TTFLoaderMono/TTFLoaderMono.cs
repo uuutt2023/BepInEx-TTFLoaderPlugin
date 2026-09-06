@@ -39,6 +39,12 @@ namespace TTFLoaderMono
         // （仅修改 TMP_Settings.defaultFontAsset 不会刷新已经在场景里实例化的 TMP 文字）
         private static TMP_FontAsset customTmpFont;
 
+        // 记录已经替换过字体的 TMP 实例 ID，用于 Naninovel 反复合时静默处理，
+        // 避免每 0.1s 轮询都刷几十行 "Replacing font on ..." 日志。
+        // 注意：UnityEngine.Object.GetInstanceID() 在 TMP 被 Destroy 时复用 ID，
+        // 但我们有引用持有，不需要操心 ID 复用。
+        private static readonly HashSet<int> replacedTmpInstances = new HashSet<int>();
+
         /// <summary>
         /// BepInEx 插件初始化时调用，类似于 Unity 的 Awake
         /// </summary>
@@ -136,22 +142,16 @@ namespace TTFLoaderMono
             ApplyCustomFontToAllTMPTexts();
             ApplyCustomFontToAllTexts();
 
-            // 前 4 次用 0.25s 间隔，覆盖场景初始化（UI Prefab 集中实例化的高峰）
-            var fastWait = new UnityEngine.WaitForSecondsRealtime(0.25f);
-            for (int i = 0; i < 4; i++)
-            {
-                yield return fastWait;
-                ApplyCustomFontToAllTMPTexts();
-                ApplyCustomFontToAllTexts();
-            }
-
-            // 之后切到 1s 间隔，稳态性能友好。
-            // Naninovel 这类视觉小说引擎没有"玩家打字"场景，文本只在过场动画/脚本推进时更新，
-            // 我们下一轮轮询会捕获 .text setter 引发的 font 替换需求。1 秒延迟在视觉上无感知。
-            var slowWait = new UnityEngine.WaitForSecondsRealtime(1.0f);
+            // 10 Hz 持续轮询。
+            // Naninovel 的 RenewalLogMessage(Clone) 每次创建新条目都会调用组件的
+            // .font setter 把字体设回原始（甚至克隆出 "Serif_Regular 2"），
+            // 这是日志里看到 'original='Serif_Regular 2'' 的原因。
+            // 0.1s 间隔能赶上 Naninovel 文本更新节奏；已替换字体的 TMP 跳过
+            // ForceMeshUpdate，开销可忽略（最多 1~2 个 TMP 真正需要重建）。
+            var wait = new UnityEngine.WaitForSecondsRealtime(0.1f);
             while (true)
             {
-                yield return slowWait;
+                yield return wait;
                 ApplyCustomFontToAllTMPTexts();
                 ApplyCustomFontToAllTexts();
             }
@@ -214,6 +214,7 @@ namespace TTFLoaderMono
             int scanned = 0;
             int expanded = 0;
             int meshRebuilt = 0;
+            int silentRestored = 0;
             foreach (var tmp in FindAllTMPComponents(includeInactive: true))
             {
                 if (tmp == null)
@@ -222,6 +223,7 @@ namespace TTFLoaderMono
                 }
                 scanned++;
                 string text = tmp.text;
+                int instanceId = tmp.GetInstanceID();
 
                 bool fontReplacedThisRound = false;
 
@@ -229,18 +231,36 @@ namespace TTFLoaderMono
                 // 因为 Naninovel 可能在我们看不见的地方切换过 fontAsset 引用。
                 if (tmp.font != customTmpFont)
                 {
+                    bool isFirstReplace = !replacedTmpInstances.Contains(instanceId);
                     string oldFontName = tmp.font != null ? tmp.font.name : "<null>";
                     string preview = text ?? string.Empty;
                     if (preview.Length > 32)
                     {
                         preview = preview.Substring(0, 32) + "…";
                     }
-                    Logger.LogInfo(
-                        $"[TextMeshProUGUI] Replacing font on '{GetScenePath(tmp)}' " +
-                        $"(active={tmp.gameObject.activeInHierarchy}, original='{oldFontName}', text='{preview}')");
+                    if (isFirstReplace)
+                    {
+                        Logger.LogInfo(
+                            $"[TextMeshProUGUI] Replacing font on '{GetScenePath(tmp)}' " +
+                            $"(active={tmp.gameObject.activeInHierarchy}, original='{oldFontName}', text='{preview}')");
+                    }
+                    else
+                    {
+                        // 之前替换过但又被 Naninovel 重置回原 font，静默恢复避免刷屏
+                        silentRestored++;
+                    }
                     tmp.font = customTmpFont;
+                    replacedTmpInstances.Add(instanceId);
                     replaced++;
                     fontReplacedThisRound = true;
+                }
+                else
+                {
+                    // 当前已经是我们的字体，记录进集合（防止后续被重置时反复打印 "Replacing"）
+                    if (!replacedTmpInstances.Contains(instanceId))
+                    {
+                        replacedTmpInstances.Add(instanceId);
+                    }
                 }
 
                 // 步骤 2：检查当前文本是否含未收录字符，若有则补齐图集。
@@ -283,8 +303,8 @@ namespace TTFLoaderMono
             if (replaced > 0 || expanded > 0 || meshRebuilt > 0)
             {
                 Logger.LogInfo(
-                    $"Applied custom TMP font to {replaced}/{scanned} TextMeshProUGUI component(s), " +
-                    $"atlas expanded for {expanded}, mesh rebuilt for {meshRebuilt}.");
+                    $"Applied custom TMP font to {replaced}/{scanned} TextMeshProUGUI component(s) " +
+                    $"(silentRestored={silentRestored}), atlas expanded for {expanded}, mesh rebuilt for {meshRebuilt}.");
             }
         }
 
