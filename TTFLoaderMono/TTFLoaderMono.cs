@@ -146,8 +146,8 @@ namespace TTFLoaderMono
             }
 
             // 之后切到 1s 间隔，稳态性能友好。
-            // 玩家触发对话/翻页/打开日志等事件时，Naninovel 会调 TMP 的 .text setter，
-            // 我们的 .font 引用还在；下一轮会替换。1 秒延迟在视觉上无感知。
+            // Naninovel 这类视觉小说引擎没有"玩家打字"场景，文本只在过场动画/脚本推进时更新，
+            // 我们下一轮轮询会捕获 .text setter 引发的 font 替换需求。1 秒延迟在视觉上无感知。
             var slowWait = new UnityEngine.WaitForSecondsRealtime(1.0f);
             while (true)
             {
