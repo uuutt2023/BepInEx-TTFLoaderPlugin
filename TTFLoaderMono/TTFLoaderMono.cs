@@ -209,11 +209,19 @@ namespace TTFLoaderMono
 
                     if (customFont != null)
                     {
-                        // 注意：Mono 环境下无法为属性或索引器“TMP_Settings.defaultFontAsset”赋值 - 它是只读的
-                        // TMP_Settings.defaultFontAsset = customFont;
-                        TextMeshProUGUI textMeshProText = GetComponent<TextMeshProUGUI>();
-                        textMeshProText.font = customFont;
-                        Logger.LogInfo($"Successfully set default TMP font to: {fontName}");
+                        // 注意：Mono 环境下直接为属性 TMP_Settings.defaultFontAsset 赋值通常会失败
+                        // （它没有公开的 set 访问器，IL2CPP 版本可绕过但 Mono 版本不一定），
+                        // 因此使用反射写入其底层字段，保证跨版本兼容。
+                        if (TrySetTmpDefaultFontAsset(customFont, out string setMsg))
+                        {
+                            Logger.LogInfo($"Successfully set default TMP font to: {fontName} ({setMsg})");
+                        }
+                        else
+                        {
+                            Logger.LogWarning(
+                                $"Created TMP font {fontName} but failed to register as default ({setMsg}). " +
+                                "Will rely on UI.Text dynamic font fallback.");
+                        }
                         return; // 成功加载一个就退出
                     }
                     else
@@ -228,6 +236,70 @@ namespace TTFLoaderMono
             {
                 Logger.LogError($"Error loading default font from directory: {ex.Message}\n{ex.StackTrace}");
             }
+        }
+
+        /// <summary>
+        /// 通过反射将自定义 TMP_FontAsset 注册为 TMP_Settings.defaultFontAsset。
+        /// TMP 在不同版本里要么把字段命名为 m_defaultFontAsset（旧版），
+        /// 要么公开一个静态属性 defaultFontAsset，但其在 Mono 程序集里通常没有 set 访问器。
+        /// 为同时兼容两种实现，这里依次尝试：静态属性 set → 私有/公有字段 m_defaultFontAsset。
+        /// </summary>
+        /// <param name="customFont">要注册为默认的 TMP_FontAsset</param>
+        /// <param name="message">成功路径或失败原因的简短说明</param>
+        /// <returns>true 表示成功写入了 defaultFontAsset；false 表示未能写入（但不会抛出异常）。</returns>
+        private bool TrySetTmpDefaultFontAsset(TMP_FontAsset customFont, out string message)
+        {
+            if (customFont == null)
+            {
+                message = "customFont is null";
+                return false;
+            }
+
+            Type settingsType = typeof(TMPro.TMP_Settings);
+            const BindingFlags flags = BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
+
+            // 1) 优先尝试静态属性 defaultFontAsset（部分版本下其 setter 是可访问的，例如 IL2CPP 运行时）
+            PropertyInfo prop = settingsType.GetProperty("defaultFontAsset", flags);
+            if (prop != null && prop.CanWrite)
+            {
+                try
+                {
+                    prop.SetValue(null, customFont);
+                    message = "via TMP_Settings.defaultFontAsset property";
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogDebug($"[TTFLoaderMono] Property defaultFontAsset set threw: {ex.Message}");
+                }
+            }
+
+            // 2) 回退到反射写底层字段。TMP 源码里常见字段名为 m_defaultFontAsset；
+            //    少数自定义分支可能使用 k_DefaultFontAsset，这里都尝试一遍。
+            string[] candidateFieldNames = { "m_defaultFontAsset", "k_DefaultFontAsset", "s_DefaultFontAsset" };
+            foreach (string fieldName in candidateFieldNames)
+            {
+                FieldInfo field = settingsType.GetField(fieldName, flags);
+                if (field == null)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    field.SetValue(null, customFont);
+                    message = $"via reflection field TMP_Settings.{fieldName}";
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogDebug(
+                        $"[TTFLoaderMono] Failed to write TMP_Settings.{fieldName}: {ex.Message}");
+                }
+            }
+
+            message = "no writable property or known backing field found on TMP_Settings";
+            return false;
         }
 
         /// <summary>
