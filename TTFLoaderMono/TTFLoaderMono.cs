@@ -298,11 +298,21 @@ namespace TTFLoaderMono
                     {
                         tmp.text = preservedText;
 
-                    // 重置 Naninovel typewriter effect 的可见字符上限
-                    // Naninovel 的 UITextRevealer 会设置 m_maxVisibleCharacters 控制逐字显示，
-                    // 但重置 font 后字符索引重新计算可能导致可见字符数停留在打字机中途状态，
-                    // 表现为'后面的字符显示为空格'。强制设回 -1（无限）恢复全部可见。
+                    // 重置 Naninovel typewriter effect 的可见字符上限 + 强制 ForceMeshUpdate
+                    // 让 TMP 立刻基于 m_maxVisibleCharacters = -1 重新渲染所有字符。
                     ResetMaxVisibleCharacters(tmp);
+                    tmp.ForceMeshUpdate(true, true);
+
+                    // 给当前 text 里所有字符一个机会出现在 atlas 里
+                    // LXGWWenKaiScreen 是 GB 字符集，约 21000 字符。
+                    // 极端日语汉字、特殊符号可能不在——fallback 到 LiberationSans 仍显示豆腐。
+                    // 这里我们手动 TryAddCharacters 一次（即便 HasCharacters 已返回 true）
+                    // 触发 TMP 内部 glyph 索引重建。
+                    if (!string.IsNullOrEmpty(text))
+                    {
+                        customTmpFont.TryAddCharacters(text);
+                    }
+                    tmp.ForceMeshUpdate(true, true);
                     }
 
                     currentFontId = customTmpFont.GetInstanceID();
