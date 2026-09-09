@@ -272,7 +272,13 @@ namespace TTFLoaderMono
                     // 如果直接 tmp.font = customTmpFont（且值变化），TMP 会做更轻量的刷新，
                     // 有时 material 缓存仍指向旧 atlas texture，导致视觉上字体没换。
                     TMP_FontAsset oldFont = tmp.font;
-                    string oldFontPath = GetScenePath(tmp);
+                    string preservedText = tmp.text;
+                    // 仅当 text 非空时才清空再恢复（空 text 跳过会避免不必要的 TMP 内部状态抖动）
+                    bool needTextReset = !string.IsNullOrEmpty(preservedText);
+                    if (needTextReset)
+                    {
+                        tmp.text = string.Empty;
+                    }
                     tmp.font = null;
                     ForceSetTmpFontAsset(tmp, customTmpFont);
                     tmp.font = customTmpFont;
@@ -283,6 +289,15 @@ namespace TTFLoaderMono
                     // 这是 TMP 真正的"加载新字体"入口，会重新走完整的 m_fontAsset →
                     // m_material → atlas texture 绑定流程。
                     ForceReloadFontAsset(tmp);
+
+                    // 关键恢复步骤：把 text 还原回去。TMP 的 m_characterLookup（字符查找表）
+                    // 只有在 .text 被重新赋值时才会基于当前 m_fontAsset 重建。如果只换字体
+                    // 不换 text，字符表里指向旧字体索引的条目会让 TMP 渲染时找不到 glyph，
+                    // 表现为字符缺失 / 字符之间出现空格占位。清空再赋值强制重建字符表。
+                    if (needTextReset)
+                    {
+                        tmp.text = preservedText;
+                    }
 
                     currentFontId = customTmpFont.GetInstanceID();
                     replaced++;
