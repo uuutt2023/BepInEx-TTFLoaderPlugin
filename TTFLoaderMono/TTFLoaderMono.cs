@@ -272,11 +272,18 @@ namespace TTFLoaderMono
                     // 如果直接 tmp.font = customTmpFont（且值变化），TMP 会做更轻量的刷新，
                     // 有时 material 缓存仍指向旧 atlas texture，导致视觉上字体没换。
                     TMP_FontAsset oldFont = tmp.font;
+                    string oldFontPath = GetScenePath(tmp);
                     tmp.font = null;
                     ForceSetTmpFontAsset(tmp, customTmpFont);
                     tmp.font = customTmpFont;
                     ForceSetTmpFontAsset(tmp, customTmpFont);
                     ForceInvalidateMaterialCache(tmp);
+
+                    // 主动调用 TMP 内部 protected LoadFontAsset()，强制重建整个字体+材质管线。
+                    // 这是 TMP 真正的"加载新字体"入口，会重新走完整的 m_fontAsset →
+                    // m_material → atlas texture 绑定流程。
+                    ForceReloadFontAsset(tmp);
+
                     currentFontId = customTmpFont.GetInstanceID();
                     replaced++;
                     fontReplacedThisRound = true;
@@ -792,6 +799,43 @@ namespace TTFLoaderMono
             catch
             {
                 // 忽略反射调用失败
+            }
+        }
+
+        /// <summary>
+        /// 通过反射调用 TMP_Text 内部的 LoadFontAsset() 方法，强制 TMP 重新走完整的
+        /// "m_fontAsset → 创建 material → 绑定 atlas texture"流程。
+        ///
+        /// 背景：TMP 的 set_font setter 只在 m_fontAsset 真的改变时清空材质缓存。如果
+        /// 我们用反射写 m_fontAsset 字段（绕过 setter），TMP 内部的 material 缓存仍然
+        /// 指向旧 atlas texture，视觉上字体没换。LoadFontAsset() 是 TMP 的"换字体"真正入口：
+        /// 解析 glyph 索引、创建/复用 material 实例、绑定 _MainTex。
+        /// </summary>
+        private static void ForceReloadFontAsset(TextMeshProUGUI tmp)
+        {
+            if (tmp == null)
+            {
+                return;
+            }
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            // TMP 不同版本可能用不同方法名
+            string[] methodNames = { "LoadFontAsset", "loadFontAsset" };
+            foreach (string name in methodNames)
+            {
+                MethodInfo mi = typeof(TMP_Text).GetMethod(name, flags);
+                if (mi == null)
+                {
+                    continue;
+                }
+                try
+                {
+                    mi.Invoke(tmp, null);
+                    return;
+                }
+                catch
+                {
+                    // 继续尝试下一个候选
+                }
             }
         }
 
