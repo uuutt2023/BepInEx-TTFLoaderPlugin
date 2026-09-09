@@ -266,8 +266,17 @@ namespace TTFLoaderMono
                     // 双重保险：除了公开 setter，还通过反射直接写入 TMP 内部的 m_fontAsset 字段。
                     // Naninovel 的 UI 脚本可能在我们的 setter 之后立即又重置 tmp.font，
                     // 但只要我们在轮询中再读到 m_fontAsset 就能保证它指向我们的字体。
+                    //
+                    // 关键：先设 null 再设目标字体。TMP 内部 setter 会清空 m_material、
+                    // m_fontSharedMaterial、m_fontMaterial 三个材质缓存并标记 dirty。
+                    // 如果直接 tmp.font = customTmpFont（且值变化），TMP 会做更轻量的刷新，
+                    // 有时 material 缓存仍指向旧 atlas texture，导致视觉上字体没换。
+                    TMP_FontAsset oldFont = tmp.font;
+                    tmp.font = null;
+                    ForceSetTmpFontAsset(tmp, customTmpFont);
                     tmp.font = customTmpFont;
                     ForceSetTmpFontAsset(tmp, customTmpFont);
+                    ForceInvalidateMaterialCache(tmp);
                     currentFontId = customTmpFont.GetInstanceID();
                     replaced++;
                     fontReplacedThisRound = true;
@@ -729,6 +738,60 @@ namespace TTFLoaderMono
                 {
                     // 继续尝试下一个候选
                 }
+            }
+        }
+
+        /// <summary>
+        /// 通过反射强制清空 TMP_Text 内部缓存的材质实例（m_material / m_fontMaterial /
+        /// m_fontSharedMaterial），让 TMP 下次渲染时按新的 fontAsset 重建材质。
+        ///
+        /// 背景：TMP_Text 在更换 .font 时，公开 setter 会调用 LoadFontAsset() 流程，
+        /// 但只有在 font 值真的"变化"或"为 null"时才会清空材质缓存并触发重建。
+        /// 当我们的轮询把 tmp.font 设回和上次相同的 customTmpFont 时，TMP 可能复用
+        /// 旧 material 实例，旧实例的 _MainTex 仍指向旧 atlas texture（被 Naninovel
+        /// 替换前的 Serif_Regular），视觉上看起来字体就没换。
+        ///
+        /// 强制把 material 缓存字段设为 null 即可让 TMP 重新走"创建新 material +
+        /// 绑定新 atlas texture"的流程。
+        /// </summary>
+        private static void ForceInvalidateMaterialCache(TextMeshProUGUI tmp)
+        {
+            if (tmp == null)
+            {
+                return;
+            }
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+            string[] fieldNames = { "m_material", "m_fontMaterial", "m_fontSharedMaterial", "m_uiEffectMaterial" };
+            foreach (string name in fieldNames)
+            {
+                FieldInfo fi = typeof(TextMeshProUGUI).GetField(name, flags);
+                if (fi == null)
+                {
+                    continue;
+                }
+                try
+                {
+                    fi.SetValue(tmp, null);
+                }
+                catch
+                {
+                    // 忽略单个字段失败，继续清理其他字段
+                }
+            }
+
+            // 同步调用 TMP 内部的 UpdateMaterial 重建材质。
+            // 这是 protected 方法，需要从派生类调用或用反射。
+            try
+            {
+                MethodInfo updateMat = typeof(TMP_Text).GetMethod("UpdateMaterial", flags);
+                if (updateMat != null)
+                {
+                    updateMat.Invoke(tmp, null);
+                }
+            }
+            catch
+            {
+                // 忽略反射调用失败
             }
         }
 
