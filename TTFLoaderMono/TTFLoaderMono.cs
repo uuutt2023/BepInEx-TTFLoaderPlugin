@@ -297,6 +297,12 @@ namespace TTFLoaderMono
                     if (needTextReset)
                     {
                         tmp.text = preservedText;
+
+                    // 重置 Naninovel typewriter effect 的可见字符上限
+                    // Naninovel 的 UITextRevealer 会设置 m_maxVisibleCharacters 控制逐字显示，
+                    // 但重置 font 后字符索引重新计算可能导致可见字符数停留在打字机中途状态，
+                    // 表现为'后面的字符显示为空格'。强制设回 -1（无限）恢复全部可见。
+                    ResetMaxVisibleCharacters(tmp);
                     }
 
                     currentFontId = customTmpFont.GetInstanceID();
@@ -852,6 +858,47 @@ namespace TTFLoaderMono
                     // 继续尝试下一个候选
                 }
             }
+        }
+
+        /// <summary>
+        /// 通过反射把 TMP_Text 的 m_maxVisibleCharacters 重置为 -1（无限可见）。
+        ///
+        /// 背景：Naninovel 的 UITextRevealer 脚本会用 typewriter 效果控制对话逐字显示，
+        /// 期间会把 m_maxVisibleCharacters 设为小于文本总长的值。我们替换字体后该字段可能
+        /// 仍停留在 typewriter 中途状态，导致'已渲染'的字符 + '未渲染'的字符之间出现空格占位
+        /// （'力' 等字符被截断后的空白）。强制重置为 -1 恢复全部可见。
+        /// 同时清零 m_visibleCharacters（公开属性 visibleCharacters 字段）避免局部状态残留。
+        /// </summary>
+        private static void ResetMaxVisibleCharacters(TextMeshProUGUI tmp)
+        {
+            if (tmp == null)
+            {
+                return;
+            }
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+            string[] fieldNames = { "m_maxVisibleCharacters", "m_visibleCharacters" };
+            foreach (string name in fieldNames)
+            {
+                FieldInfo fi = typeof(TMP_Text).GetField(name, flags);
+                if (fi == null)
+                {
+                    continue;
+                }
+                try
+                {
+                    // m_maxVisibleCharacters 设 -1 表示无限；m_visibleCharacters 设 0 配合强制重排
+                    int newValue = name == "m_maxVisibleCharacters" ? -1 : 0;
+                    fi.SetValue(tmp, newValue);
+                }
+                catch
+                {
+                    // 忽略单字段失败
+                }
+            }
+
+            // 通过公开属性 visibleCharacters 兜底（仅 getter，setter 不存在）
+            // 真正写的是底层字段 m_visibleCharacters
+            tmp.maxVisibleCharacters = 99999;
         }
 
         /// <summary>
